@@ -349,7 +349,7 @@ def sync_slots(cache):
                         skipped += 1
                 else:
                     # Create new slot
-                    presenca_api("POST", "slots", {
+                    resp = presenca_api("POST", "slots", {
                         "professionalId": prof_presenca_id,
                         "specialtyId": spec_id,
                         "procedureId": proc_uuid,
@@ -360,7 +360,10 @@ def sync_slots(cache):
                         "isBlocked": False,
                         "externalId": ext_slot_id,
                     })
-                    created += 1
+                    if resp and resp.get("conflict"):
+                        skipped += 1  # Already exists without externalId
+                    else:
+                        created += 1
 
         if created or unblocked:
             log.info("[SLOTS] %s: +%d created, %d unblocked, %d skipped",
