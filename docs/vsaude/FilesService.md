@@ -1,36 +1,46 @@
 # FilesService
 
-Base: `https://public-api.vsaude.com.br/api/services/app/FilesService`
+**Base URL:** `https://public-api.vsaude.com.br/api/services/app/FilesService`
 
-Auth: `VSAUDE-API-KEY: {key}`
+**Auth:** `VSAUDE-API-KEY: {key}`
+
+**Envelope:** `{ result, success, error, __abp }`
+
+---
 
 ## POST /ListFolder
 
-Listar arquivos do paciente
+**Listar arquivos do paciente**
 
-**Body:**
+Retorna todos os arquivos e pastas do paciente.
 
-| Campo | Tipo |
-|---|---|
-| `keyword` | string |
-| `patient` | string(uuid) |
-| `user` | integer(int64) |
-| `id` | string(uuid) |
-| `sorting` | string |
-| `deletedOnly` | boolean |
+**Request Body:**
+
+| Campo | Tipo | Obrigatorio |
+|---|---|---|
+| `keyword` | string | nao |
+| `patient` | string(uuid) | nao |
+| `user` | integer(int64) | nao |
+| `id` | string(uuid) | nao |
+| `sorting` | string | nao |
+| `deletedOnly` | boolean | nao |
 
 ---
 
 ## POST /Upload
 
-Upload de arquivo
+**Upload de arquivo**
 
-**Query params:**
+Utilizado para adicionar arquivo ao paciente.
 
-| `parent` | string |
-| `ownerUser` | integer |
-| `ownerPatient` | string |
-| `fileName` | string |
+**Query Parameters:**
+
+| Param | Tipo | Formato |
+|---|---|---|
+| `parent` | string | uuid |
+| `ownerUser` | integer | int64 |
+| `ownerPatient` | string | uuid |
+| `fileName` | string |  |
 
 ---
 

@@ -1,35 +1,49 @@
 # HealthProfessionalService
 
-Base: `https://public-api.vsaude.com.br/api/services/app/HealthProfessionalService`
+Gerencia profissionais de saude (medicos, psicologos).
 
-Auth: `VSAUDE-API-KEY: {key}`
+**Base URL:** `https://public-api.vsaude.com.br/api/services/app/HealthProfessionalService`
+
+**Auth:** `VSAUDE-API-KEY: {key}`
+
+**Envelope:** `{ result, success, error, __abp }`
+
+---
 
 ## POST /AuthenticateHealthProfessional
 
-Autenticar profissional
+**Autenticar profissional**
 
-**Body:**
+Se nao existe profissional com o e-mail informado, sera criado, e autenticado
 
-| Campo | Tipo |
-|---|---|
-| `email` | string |
-| `name` | string |
+Se o email nao existe, cria o profissional automaticamente.
+
+**Request Body:**
+
+| Campo | Tipo | Obrigatorio |
+|---|---|---|
+| `email` | string | nao |
+| `name` | string | nao |
 
 ---
 
 ## POST /GetAll
 
-Listar profissionais de saúde
+**Listar profissionais de saúde**
 
-**Body:**
+Retorna todos os profissionais de forma paginada e ordenada.
 
-| Campo | Tipo |
-|---|---|
-| `text` | string |
-| `professional` | string(uuid) |
-| `sorting` | string |
-| `skipCount` | integer(int32) |
-| `maxResultCount` | integer(int32) |
+Retorna dados basicos. Para obter CRM/licenca, usar GET individual por ID (nao disponivel na API publica).
+
+**Request Body:**
+
+| Campo | Tipo | Obrigatorio |
+|---|---|---|
+| `text` | string | nao |
+| `professional` | string(uuid) | nao |
+| `sorting` | string | nao |
+| `skipCount` | integer(int32) | nao |
+| `maxResultCount` | integer(int32) | nao |
 
 ---
 
