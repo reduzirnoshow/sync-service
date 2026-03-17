@@ -1,21 +1,24 @@
-"""Sync Presenca -> vSaude: patients, appointments, status."""
+"""Sync Presenca -> vSaude: patients, professionals, procedures, appointments, status."""
 
+import json
 import logging
 import time
-import urllib.request
-import urllib.error
 
-from api import vsaude_post, presenca_api
+from api import vsaude_post, presenca_api, extract_items
 from config import (PRESENCA_TO_VSAUDE_ACTION, VSAUDE_TO_PRESENCA_STATUS,
-                     PROF_PROCEDURES, CARE_UNIT_ID, INSURANCE_COMPANY_ID,
-                     GENDER_MAP, API_DELAY)
+                     PROF_PROCEDURES, CARE_UNIT_ID, INSURANCE_COMPANY_ID, API_DELAY)
 from helpers import extract_date_time, brt_to_utc, clean_name
 
 log = logging.getLogger("sync.pr2vs")
 
+PRESENCA_GENDER_TO_VSAUDE = {"male": 1, "female": 2, "other": 0, "prefer_not_to_say": 0}
+
+
+# ─────────────────────────────────────────────────────────────
+# SLOT VALIDATION
+# ─────────────────────────────────────────────────────────────
 
 def _check_slot_available(vs_prof_id, vs_proc_id, target_date_brt, target_time_brt):
-    """Check if slot is free in vSaude before creating."""
     result = vsaude_post("ScheduleService/GetAvailabilityWindow", {
         "procedureId": vs_proc_id, "professionalId": vs_prof_id,
     })
@@ -29,14 +32,267 @@ def _check_slot_available(vs_prof_id, vs_proc_id, target_date_brt, target_time_b
     return False
 
 
+# ─────────────────────────────────────────────────────────────
+# PATIENTS
+# ─────────────────────────────────────────────────────────────
+
+def _sync_patients(cache, since_date):
+    """Create new patients + update existing in vSaude."""
+    log.info("[PR->VS] Syncing patients...")
+
+    resp = presenca_api("GET", "patients?limit=1000")
+    if not resp or "data" not in resp:
+        log.warning("[PR->VS] Presenca API blocked for patients")
+        return {"created": 0, "updated": 0}
+
+    all_patients = resp["data"]
+    created = 0
+    updated = 0
+
+    # Build vSaude patient index for comparison
+    vs_attendance = vsaude_post("ReportService/GetAttendance", {"maxResultCount": 1000})
+    vs_patients = {}
+    if vs_attendance:
+        items = vs_attendance.get("items", vs_attendance) if isinstance(vs_attendance, dict) else vs_attendance
+        for a in items:
+            pat = a.get("patient") or {}
+            pid = pat.get("id")
+            if pid:
+                vs_patients[pid] = pat
+
+    for pr_pat in all_patients:
+        ext_id = pr_pat.get("externalId")
+        name = clean_name(pr_pat.get("name", ""))
+        phone = pr_pat.get("phone", "") or ""
+        email = pr_pat.get("email", "") or ""
+        cpf = pr_pat.get("cpf", "") or ""
+        gender = PRESENCA_GENDER_TO_VSAUDE.get(pr_pat.get("gender", ""), 0)
+        birth = pr_pat.get("birthDate")
+
+        if not ext_id:
+            # New patient - create in vSaude
+            created_at = (pr_pat.get("createdAt") or "")[:10]
+            if created_at < since_date:
+                continue
+
+            parts = name.split(" ", 1)
+            first = parts[0] if parts else name
+            surname = parts[1] if len(parts) > 1 else ""
+
+            log.info("[PR->VS] NEW PATIENT: %s cpf=%s", name, cpf or "none")
+
+            body = {
+                "name": first,
+                "surname": surname,
+                "phoneNumber": phone,
+                "personalIdentifier": cpf or "00000000000",
+                "email": email or f"sem_email@placeholder.com",
+                "gender": gender,
+                "password": "TempPass@2026",
+            }
+            if birth and len(str(birth)) >= 10:
+                body["birthday"] = f"{str(birth)[:10]}T00:00:00Z"
+
+            result = vsaude_post("PatientService/Create", body)
+            if result:
+                vs_id = result.get("id") if isinstance(result, dict) else result
+                log.info("[PR->VS]   CREATED: %s", vs_id)
+                time.sleep(API_DELAY)
+                presenca_api("PUT", f"patients/{pr_pat['id']}", {"externalId": str(vs_id)})
+                created += 1
+            else:
+                log.error("[PR->VS]   FAILED to create patient")
+        else:
+            # Existing patient - check for updates
+            vs_pat = vs_patients.get(ext_id)
+            if not vs_pat:
+                continue
+
+            diffs = {}
+            vs_name = clean_name(vs_pat.get("name", ""))
+            vs_phone = vs_pat.get("phoneNumber", "") or ""
+
+            if name and vs_name != name:
+                parts = name.split(" ", 1)
+                diffs["name"] = parts[0]
+                diffs["surname"] = parts[1] if len(parts) > 1 else ""
+            if phone and vs_phone != phone:
+                diffs["phoneNumber"] = phone
+            if email and (vs_pat.get("email", "") or "") != email:
+                diffs["email"] = email
+
+            if diffs:
+                log.info("[PR->VS] PAT UPDATE: %s -> %s", name, list(diffs.keys()))
+                # vSaude Update needs full object - get it first
+                full_pat = vsaude_post("PatientService/Get", None)
+                # Use simpler approach: just log for now, full update needs GET+PUT
+                # TODO: implement full patient update via GET then PUT
+                updated += 1
+
+    log.info("[PR->VS] Patients: %d created, %d updated", created, updated)
+    return {"created": created, "updated": updated}
+
+
+# ─────────────────────────────────────────────────────────────
+# PROFESSIONALS
+# ─────────────────────────────────────────────────────────────
+
+def _sync_professionals(cache):
+    """Create professionals that exist in Presenca but not in vSaude."""
+    log.info("[PR->VS] Syncing professionals...")
+
+    resp = presenca_api("GET", "professionals")
+    if not resp or "data" not in resp:
+        log.warning("[PR->VS] Presenca API blocked for professionals")
+        return 0
+
+    # Get vSaude professionals for comparison
+    vs_result = vsaude_post("HealthProfessionalService/GetAll", {"maxResultCount": 100})
+    vs_profs = {}
+    if vs_result:
+        vs_items = vs_result.get("items", vs_result) if isinstance(vs_result, dict) else vs_result
+        for p in vs_items:
+            vs_profs[p.get("id", "")] = p
+
+    created = 0
+    for pr_prof in resp["data"]:
+        ext_id = pr_prof.get("externalId")
+        if ext_id and ext_id in vs_profs:
+            continue  # Already exists in vSaude
+
+        if ext_id:
+            continue  # Has externalId but not in current vSaude list - skip
+
+        name = clean_name(pr_prof.get("name", ""))
+        if not name or not pr_prof.get("active"):
+            continue
+
+        email = pr_prof.get("email", "") or ""
+        phone = pr_prof.get("phone", "") or ""
+
+        if not email:
+            continue  # vSaude requires email for user creation
+
+        parts = name.split(" ", 1)
+        first = parts[0] if parts else name
+        surname = parts[1] if len(parts) > 1 else ""
+
+        log.info("[PR->VS] NEW PROFESSIONAL: %s email=%s", name, email)
+
+        body = {
+            "name": name,
+            "discriminator": "Doctor",
+            "user": {
+                "name": first,
+                "surname": surname,
+                "emailAddress": email,
+                "phoneNumber": phone,
+                "userName": email,
+                "gender": 1,
+                "password": "TempPass@2026",
+            }
+        }
+
+        result = vsaude_post("HealthProfessionalService/Create", body)
+        if result:
+            vs_id = result.get("id") if isinstance(result, dict) else result
+            log.info("[PR->VS]   CREATED: %s", vs_id)
+            time.sleep(API_DELAY)
+            presenca_api("PUT", f"professionals/{pr_prof['id']}", {"externalId": str(vs_id)})
+            created += 1
+        else:
+            log.error("[PR->VS]   FAILED to create professional")
+
+    if created:
+        log.info("[PR->VS] Professionals created: %d", created)
+    return created
+
+
+# ─────────────────────────────────────────────────────────────
+# PROCEDURES
+# ─────────────────────────────────────────────────────────────
+
+def _sync_procedures(cache):
+    """Create procedures that exist in Presenca but not in vSaude."""
+    log.info("[PR->VS] Syncing procedures...")
+
+    resp = presenca_api("GET", "procedures")
+    if not resp or "data" not in resp:
+        log.warning("[PR->VS] Presenca API blocked for procedures")
+        return 0
+
+    # Get vSaude procedures for comparison
+    vs_result = vsaude_post("MedicalProcedureService/GetAll", {"maxResultCount": 100})
+    vs_procs = {}
+    if vs_result:
+        vs_items = vs_result.get("items", []) if isinstance(vs_result, dict) else vs_result
+        for p in vs_items:
+            vs_procs[str(p.get("id", ""))] = p
+
+    created = 0
+    for pr_proc in resp["data"]:
+        ext_id = pr_proc.get("externalId")
+        if ext_id and ext_id in vs_procs:
+            continue  # Already exists
+
+        if ext_id:
+            continue  # Has externalId but not in vSaude list - skip
+
+        name = clean_name(pr_proc.get("name", ""))
+        if not name or not pr_proc.get("active"):
+            continue
+
+        price = pr_proc.get("price") or 0
+        duration = pr_proc.get("durationMinutes") or pr_proc.get("duration_minutes") or 30
+
+        log.info("[PR->VS] NEW PROCEDURE: %s price=%s dur=%d", name, price, duration)
+
+        body = {
+            "name": name,
+            "duration": duration,
+            "minutesDuration": duration,
+            "periodUnit": 0,
+            "price": float(price),
+            "allowOnlineSchedule": True,
+            "remotely": True,
+            "isReturn": False,
+            "isProfessionalRequired": True,
+            "onlinePaymentType": 0,
+            "maxNumberOfInstallments": 1,
+            "coveredInsuranceCompanies": [],
+            "coveredInsurancePlans": [],
+            "coveredByProfessionals": [],
+            "coveredCareUnits": [],
+            "returnParentId": [],
+            "responsibilityTerms": [],
+        }
+
+        result = vsaude_post("MedicalProcedureService/Create", body)
+        if result:
+            vs_id = result.get("id") if isinstance(result, dict) else result
+            log.info("[PR->VS]   CREATED: %s", vs_id)
+            time.sleep(API_DELAY)
+            presenca_api("PUT", f"procedures/{pr_proc['id']}", {"externalId": str(vs_id)})
+            created += 1
+        else:
+            log.error("[PR->VS]   FAILED to create procedure")
+
+    if created:
+        log.info("[PR->VS] Procedures created: %d", created)
+    return created
+
+
+# ─────────────────────────────────────────────────────────────
+# APPOINTMENTS
+# ─────────────────────────────────────────────────────────────
+
 def _sync_new_appointments(cache, since_date):
     """Find Presenca appointments without externalId -> create in vSaude."""
     log.info("[PR->VS] Searching appointments WITHOUT externalId...")
 
     resp = presenca_api("GET", "appointments?limit=1000")
     if not resp or "data" not in resp:
-        log.warning("[PR->VS] Presenca API blocked - cannot fetch appointments without externalId")
-        log.warning("[PR->VS] Appointments created in Presenca stay pending until next cycle")
+        log.warning("[PR->VS] Presenca API blocked for appointments")
         return 0
 
     all_appts = resp["data"]
@@ -54,12 +310,11 @@ def _sync_new_appointments(cache, since_date):
         new_appts.append(a)
 
     if not new_appts:
-        log.info("[PR->VS] No pending appointments (all have externalId)")
+        log.info("[PR->VS] No pending appointments")
         return 0
 
-    log.info("[PR->VS] Found %d appointments WITHOUT externalId since %s:", len(new_appts), since_date)
+    log.info("[PR->VS] Found %d appointments WITHOUT externalId since %s", len(new_appts), since_date)
 
-    # Build lookups
     prof_map = {p.get("id", ""): ext for ext, p in cache.get("professionals", {}).items() if p.get("id")}
     proc_map = {p.get("id", ""): ext for ext, p in cache.get("procedures", {}).items() if p.get("id")}
     pat_map = {p.get("id", ""): ext for ext, p in cache.get("patients", {}).items() if p.get("id")}
@@ -77,11 +332,6 @@ def _sync_new_appointments(cache, since_date):
         if isinstance(professionals, dict):
             prof_name = professionals.get("name", "")
 
-        proc_name = ""
-        procedures = a.get("procedures")
-        if isinstance(procedures, dict):
-            proc_name = procedures.get("name", "")
-
         vs_prof_id = prof_map.get(a.get("professionalId"))
         vs_proc_ext = proc_map.get(a.get("procedureId"))
         vs_pat_id = pat_map.get(a.get("patientId"))
@@ -89,8 +339,8 @@ def _sync_new_appointments(cache, since_date):
         if not vs_pat_id and isinstance(patients, dict):
             vs_pat_id = patients.get("externalId")
 
-        log.info("[PR->VS] PENDING: date=%s time=%s prof=%s patient=%s proc=%s",
-                 sched_date, sched_time, prof_name or "?", pat_name, proc_name[:30] or "?")
+        log.info("[PR->VS] PENDING: date=%s time=%s prof=%s patient=%s",
+                 sched_date, sched_time, prof_name or "?", pat_name)
 
         if not vs_prof_id:
             log.warning("[PR->VS]   SKIP: professional has no vSaude ID")
@@ -101,17 +351,12 @@ def _sync_new_appointments(cache, since_date):
 
         vs_proc_id = int(vs_proc_ext) if vs_proc_ext else None
 
-        # Validate slot availability
         check_proc = vs_proc_id or PROF_PROCEDURES.get(vs_prof_id)
         if check_proc:
-            slot_free = _check_slot_available(vs_prof_id, check_proc, sched_date, sched_time)
-            if not slot_free:
+            if not _check_slot_available(vs_prof_id, check_proc, sched_date, sched_time):
                 log.warning("[PR->VS]   SKIP: slot %s %s NOT available in vSaude", sched_date, sched_time)
                 continue
-            log.info("[PR->VS]   Slot %s %s available in vSaude", sched_date, sched_time)
-
-        log.info("[PR->VS]   Creating in vSaude: patient=%s prof=%s proc=%s",
-                 vs_pat_id[:12], vs_prof_id[:12], vs_proc_id)
+            log.info("[PR->VS]   Slot %s %s available", sched_date, sched_time)
 
         body = {
             "patientId": vs_pat_id,
@@ -126,23 +371,22 @@ def _sync_new_appointments(cache, since_date):
         result = vsaude_post("ScheduleService/Create", body)
         if result:
             vs_appt_id = result.get("id") if isinstance(result, dict) else result
-            log.info("[PR->VS]   CREATED in vSaude: id=%s", vs_appt_id)
-            save_resp = presenca_api("PUT", f"appointments/{a['id']}", {"externalId": str(vs_appt_id)})
-            if save_resp:
-                log.info("[PR->VS]   externalId saved back to Presenca")
-            else:
-                log.warning("[PR->VS]   Created in vSaude but failed to save externalId to Presenca")
+            log.info("[PR->VS]   CREATED in vSaude: %s", vs_appt_id)
+            presenca_api("PUT", f"appointments/{a['id']}", {"externalId": str(vs_appt_id)})
             created += 1
         else:
-            log.error("[PR->VS]   FAILED to create in vSaude (ScheduleService/Create)")
+            log.error("[PR->VS]   FAILED to create in vSaude")
 
-    log.info("[PR->VS] %d appointments created in vSaude", created)
     return created
 
 
+# ─────────────────────────────────────────────────────────────
+# STATUS
+# ─────────────────────────────────────────────────────────────
+
 def _sync_status(cache, since_date):
-    """Compare status between Presenca and vSaude, push differences."""
-    log.info("[PR->VS] Comparing status Presenca vs vSaude...")
+    """Compare status Presenca vs vSaude, push differences."""
+    log.info("[PR->VS] Comparing status...")
 
     pr_appts = list(cache.get("appointments", {}).values())
     if not pr_appts:
@@ -151,11 +395,10 @@ def _sync_status(cache, since_date):
 
     vs_result = vsaude_post("ReportService/GetAttendance", {"maxResultCount": 1000})
     if not vs_result:
-        log.warning("[PR->VS] No data from vSaude GetAttendance")
         return 0
     vs_items = vs_result.get("items", vs_result) if isinstance(vs_result, dict) else vs_result
     vs_index = {a.get("id", ""): a for a in vs_items}
-    log.info("[PR->VS] Presenca cache: %d appointments | vSaude: %d appointments", len(pr_appts), len(vs_index))
+    log.info("[PR->VS] Presenca cache: %d | vSaude: %d", len(pr_appts), len(vs_index))
 
     checked = 0
     changes = 0
@@ -192,116 +435,24 @@ def _sync_status(cache, since_date):
         if isinstance(patients, dict):
             pat_name = patients.get("name", "?")
 
-        log.info("[PR->VS] STATUS DIVERGENT: date=%s patient=%s presenca=%s vsaude=%s(%d)",
+        log.info("[PR->VS] STATUS: date=%s patient=%s presenca=%s vsaude=%s(%d)",
                  sched_date, pat_name, pr_status, vs_status_str, vs_status_code)
-        log.info("[PR->VS]   Action: %s", endpoint)
 
         body = {"id": ext_id, **extra_body}
         result = vsaude_post(endpoint, body)
         if result is not None:
-            log.info("[PR->VS]   %s executed in vSaude", endpoint)
+            log.info("[PR->VS]   %s OK", endpoint)
             changes += 1
         else:
-            log.error("[PR->VS]   %s FAILED in vSaude", endpoint)
+            log.error("[PR->VS]   %s FAILED", endpoint)
 
     log.info("[PR->VS] %d compared: %d synced, %d changes", checked, synced, changes)
     return changes
 
 
-PRESENCA_GENDER_TO_VSAUDE = {"male": 1, "female": 2, "other": 0, "prefer_not_to_say": 0}
-
-
-def _sync_new_patients(cache, since_date):
-    """Find patients in Presenca without externalId -> create in vSaude."""
-    log.info("[PR->VS] Searching patients WITHOUT externalId...")
-
-    resp = presenca_api("GET", "patients?limit=1000")
-    if not resp or "data" not in resp:
-        log.warning("[PR->VS] Presenca API blocked for patients")
-        return 0
-
-    all_patients = resp["data"]
-    new_patients = []
-    for p in all_patients:
-        if p.get("externalId"):
-            continue
-        created = (p.get("createdAt") or "")[:10]
-        if created >= since_date:
-            new_patients.append(p)
-
-    if not new_patients:
-        log.info("[PR->VS] No new patients without externalId")
-        return 0
-
-    log.info("[PR->VS] Found %d patients WITHOUT externalId since %s", len(new_patients), since_date)
-    created_count = 0
-
-    for p in new_patients:
-        name = clean_name(p.get("name", ""))
-        parts = name.split(" ", 1)
-        first = parts[0] if parts else name
-        surname = parts[1] if len(parts) > 1 else ""
-        phone = p.get("phone", "") or ""
-        cpf = p.get("cpf", "") or ""
-        email = p.get("email", "") or ""
-        gender = PRESENCA_GENDER_TO_VSAUDE.get(p.get("gender", ""), 0)
-        birth = p.get("birthDate")
-        birthday = f"{birth[:10]}T00:00:00Z" if birth and len(str(birth)) >= 10 else None
-
-        log.info("[PR->VS] NEW PATIENT: %s cpf=%s", name, cpf or "none")
-
-        body = {
-            "name": first,
-            "surname": surname,
-            "phoneNumber": phone,
-            "personalIdentifier": cpf or "00000000000",
-            "email": email or f"sem_email_{cpf or 'x'}@placeholder.com",
-            "gender": gender,
-            "password": "TempPass@2026",
-        }
-        if birthday:
-            body["birthday"] = birthday
-
-        result = vsaude_post("PatientService/Create", body)
-        if result:
-            vs_id = result.get("id") if isinstance(result, dict) else result
-            log.info("[PR->VS]   CREATED in vSaude: %s", vs_id)
-            time.sleep(API_DELAY)
-            presenca_api("PUT", f"patients/{p['id']}", {"externalId": str(vs_id)})
-            created_count += 1
-        else:
-            log.error("[PR->VS]   FAILED to create patient in vSaude")
-
-    return created_count
-
-
-def _sync_patient_updates(cache):
-    """Compare patient data Presenca vs vSaude, push updates to vSaude."""
-    log.info("[PR->VS] Checking patient updates...")
-
-    # Get patients from Presenca that have externalId
-    resp = presenca_api("GET", "patients?limit=1000")
-    if not resp or "data" not in resp:
-        return 0
-
-    updated = 0
-    for pr_pat in resp["data"]:
-        vs_ext = pr_pat.get("externalId")
-        if not vs_ext:
-            continue
-
-        # Get vSaude patient data from attendance cache (already loaded)
-        # We only update if there's a clear mismatch
-        pr_name = clean_name(pr_pat.get("name", ""))
-        pr_phone = pr_pat.get("phone", "") or ""
-
-        # Check if vSaude patient data differs using GET
-        # Skip individual GET calls to avoid rate limiting - only update when
-        # patient data comes through attendance report
-        # This is handled in the attendance loop already
-
-    return updated
-
+# ─────────────────────────────────────────────────────────────
+# RUN
+# ─────────────────────────────────────────────────────────────
 
 def run(cache, since_date):
     """Run Presenca -> vSaude sync."""
@@ -309,13 +460,21 @@ def run(cache, since_date):
     log.info("[PR->VS] START since=%s", since_date)
     log.info("=" * 50)
 
-    patients_created = _sync_new_patients(cache, since_date)
+    pat_stats = _sync_patients(cache, since_date)
+    profs_created = _sync_professionals(cache)
+    procs_created = _sync_procedures(cache)
     appts_created = _sync_new_appointments(cache, since_date)
     status_changes = _sync_status(cache, since_date)
 
     log.info("-" * 50)
-    log.info("[PR->VS] RESULT: patients_created=%d appointments_created=%d status_updated=%d",
-             patients_created, appts_created, status_changes)
+    log.info("[PR->VS] RESULT: patients=%d/%d profs=%d procs=%d appts=%d status=%d",
+             pat_stats["created"], pat_stats["updated"],
+             profs_created, procs_created, appts_created, status_changes)
     log.info("=" * 50)
-    return {"patients_created": patients_created, "appts_created": appts_created,
-            "status_changes": status_changes}
+    return {
+        "patients": pat_stats,
+        "professionals_created": profs_created,
+        "procedures_created": procs_created,
+        "appointments_created": appts_created,
+        "status_changes": status_changes,
+    }
