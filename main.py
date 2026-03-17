@@ -100,7 +100,7 @@ def main():
 
     log.info("=" * 60)
     log.info("Sync Service STARTED")
-    log.info("  vSaude -> Presenca: every %ds", INTERVAL_VS_TO_PR)
+    log.info("  vSaude -> Presenca (appts+slots): every %ds", INTERVAL_VS_TO_PR)
     log.info("  Presenca -> vSaude: every %ds", INTERVAL_PR_TO_VS)
     log.info("  Cache refresh: every %ds", CACHE_REFRESH)
     log.info("  Loop sleep: %ds", LOOP_SLEEP)
