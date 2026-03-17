@@ -354,7 +354,12 @@ def _sync_new_appointments(cache, since_date):
         check_proc = vs_proc_id or PROF_PROCEDURES.get(vs_prof_id)
         if check_proc:
             if not _check_slot_available(vs_prof_id, check_proc, sched_date, sched_time):
-                log.warning("[PR->VS]   SKIP: slot %s %s NOT available in vSaude", sched_date, sched_time)
+                log.warning("[PR->VS]   SLOT UNAVAILABLE: %s %s - cancelling in Presenca", sched_date, sched_time)
+                time.sleep(API_DELAY)
+                presenca_api("POST", f"appointments/{a['id']}/cancel", {
+                    "reason": f"Slot {sched_date} {sched_time} indisponivel no vSaude. Horario ocupado ou bloqueado pelo medico."
+                })
+                log.info("[PR->VS]   Appointment cancelled in Presenca (slot unavailable)")
                 continue
             log.info("[PR->VS]   Slot %s %s available", sched_date, sched_time)
 

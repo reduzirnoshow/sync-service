@@ -279,24 +279,29 @@ def run(cache, since_date):
     return stats
 
 
+def _slot_exists(ext_slot_id):
+    """Check if a slot exists in Presenca by externalId."""
+    resp = presenca_api("GET", f"slots?externalId={ext_slot_id}")
+    if resp and "data" in resp and resp["data"]:
+        return resp["data"][0]
+    return None
+
+
 def sync_slots(cache):
-    """Sync slots: get free slots from vSaude, update Presenca.
+    """Sync slots from vSaude availability to Presenca.
 
     For each professional:
     1. Get free slots from vSaude (GetAvailabilityWindow)
-    2. Get current slots from Presenca API
-    3. Slot in vSaude FREE + not in Presenca -> create as available
-    4. Slot in vSaude FREE + Presenca blocked -> unblock
-    5. Slot in Presenca available + NOT in vSaude -> block (occupied or doctor blocked)
+    2. For each free slot: check by externalId if exists in Presenca
+       - Not exists -> create
+       - Exists but blocked -> unblock
+       - Exists and available -> skip (no-op)
     """
-    log.info("=" * 50)
     log.info("[SLOTS] START")
-    log.info("=" * 50)
 
     total_created = 0
-    total_blocked = 0
     total_unblocked = 0
-    total_deleted = 0
+    total_skipped = 0
 
     for ext_id, prof in cache.get("professionals", {}).items():
         proc_id = PROF_PROCEDURES.get(ext_id)
@@ -306,94 +311,65 @@ def sync_slots(cache):
         prof_name = prof.get("name", "?")
         prof_presenca_id = prof.get("id")
 
-        # 1. Get FREE slots from vSaude
+        # Get FREE slots from vSaude
         result = vsaude_post("ScheduleService/GetAvailabilityWindow", {
             "procedureId": proc_id, "professionalId": ext_id,
         })
         if not result:
-            log.warning("[SLOTS] %s: no data from vSaude", prof_name)
             continue
 
-        vs_free = {}  # (date, time) -> True
+        pr_proc = cache.get("procedures", {}).get(str(proc_id))
+        spec_id = pr_proc.get("specialtyId", SPEC_PSIQ) if pr_proc else SPEC_PSIQ
+        proc_uuid = pr_proc.get("id") if pr_proc else None
+
+        created = 0
+        unblocked = 0
+        skipped = 0
+
         for day in result:
             for slot in day.get("availability", []):
                 slot_date, slot_time = utc_to_brt(slot.get("time", ""))
-                if slot_date:
-                    vs_free[(slot_date, slot_time)] = True
+                if not slot_date:
+                    continue
 
-        # 2. Get current Presenca slots for this professional
-        time.sleep(API_DELAY)
-        pr_resp = presenca_api("GET",
-            f"slots?professionalId={prof_presenca_id}&dateFrom=2026-03-17&dateTo=2026-12-31")
+                ext_slot_id = f"{ext_id}_{slot_date}_{slot_time}"
 
-        pr_slots = {}  # (date, time) -> slot obj
-        if pr_resp and "data" in pr_resp:
-            for s in pr_resp["data"]:
-                s_date = (s.get("slotDate") or "")[:10]
-                raw_time = s.get("slotTime") or ""
-                if "T" in raw_time:
-                    s_time = raw_time.split("T")[1][:5]
-                else:
-                    s_time = raw_time[:5]
-                if s_date and s_time:
-                    pr_slots[(s_date, s_time)] = s
-
-        created = 0
-        blocked = 0
-        unblocked = 0
-
-        # 3. vSaude FREE slots -> create or unblock in Presenca
-        for (date, tm) in vs_free:
-            if (date, tm) in pr_slots:
-                slot = pr_slots[(date, tm)]
-                if not slot.get("isAvailable") or slot.get("isBlocked"):
-                    # Slot exists but blocked -> unblock
-                    time.sleep(API_DELAY)
-                    presenca_api("PUT", f"slots/{slot['id']}", {
-                        "isAvailable": True, "isBlocked": False,
-                    })
-                    unblocked += 1
-            else:
-                # Slot doesn't exist in Presenca -> create
-                pr_proc = cache.get("procedures", {}).get(str(proc_id))
-                spec_id = pr_proc.get("specialtyId", SPEC_PSIQ) if pr_proc else SPEC_PSIQ
-                proc_uuid = pr_proc.get("id") if pr_proc else None
-                ext_slot_id = f"{ext_id}_{date}_{tm}"
-
+                # Check if exists by externalId
                 time.sleep(API_DELAY)
-                presenca_api("POST", "slots", {
-                    "professionalId": prof_presenca_id,
-                    "specialtyId": spec_id,
-                    "procedureId": proc_uuid,
-                    "slotDate": date,
-                    "slotTime": tm,
-                    "durationMinutes": 30,
-                    "isAvailable": True,
-                    "isBlocked": False,
-                    "externalId": ext_slot_id,
-                })
-                created += 1
+                existing = _slot_exists(ext_slot_id)
 
-        # 4. Presenca slots that are NOT free in vSaude -> block
-        for (date, tm), slot in pr_slots.items():
-            if (date, tm) not in vs_free:
-                if slot.get("isAvailable") and not slot.get("isBlocked"):
-                    time.sleep(API_DELAY)
-                    presenca_api("PUT", f"slots/{slot['id']}", {
-                        "isAvailable": False, "isBlocked": True,
+                if existing:
+                    if not existing.get("isAvailable") or existing.get("isBlocked"):
+                        # Blocked -> unblock
+                        presenca_api("PUT", f"slots/{existing['id']}", {
+                            "isAvailable": True, "isBlocked": False,
+                        })
+                        unblocked += 1
+                    else:
+                        skipped += 1
+                else:
+                    # Create new slot
+                    presenca_api("POST", "slots", {
+                        "professionalId": prof_presenca_id,
+                        "specialtyId": spec_id,
+                        "procedureId": proc_uuid,
+                        "slotDate": slot_date,
+                        "slotTime": slot_time,
+                        "durationMinutes": 30,
+                        "isAvailable": True,
+                        "isBlocked": False,
+                        "externalId": ext_slot_id,
                     })
-                    blocked += 1
+                    created += 1
 
-        if created or blocked or unblocked:
-            log.info("[SLOTS] %s: +%d created, %d blocked, %d unblocked",
-                     prof_name, created, blocked, unblocked)
+        if created or unblocked:
+            log.info("[SLOTS] %s: +%d created, %d unblocked, %d skipped",
+                     prof_name, created, unblocked, skipped)
 
         total_created += created
-        total_blocked += blocked
         total_unblocked += unblocked
+        total_skipped += skipped
 
-    log.info("-" * 50)
-    log.info("[SLOTS] RESULT: created=%d blocked=%d unblocked=%d",
-             total_created, total_blocked, total_unblocked)
-    log.info("=" * 50)
-    return {"created": total_created, "blocked": total_blocked, "unblocked": total_unblocked}
+    log.info("[SLOTS] RESULT: created=%d unblocked=%d skipped=%d",
+             total_created, total_unblocked, total_skipped)
+    return {"created": total_created, "unblocked": total_unblocked}
