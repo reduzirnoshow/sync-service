@@ -44,8 +44,6 @@ def presenca_api(method, path, body=None):
         return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         err = e.read().decode()[:300] if e.fp else ""
-        if e.code == 409:
-            return {"conflict": True}  # Already exists, not an error
         log.warning("[PRESENCA] %s %s: HTTP %s - %s", method, path, e.code, err)
         return None
     except Exception as e:

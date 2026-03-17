@@ -279,23 +279,36 @@ def run(cache, since_date):
     return stats
 
 
-def _slot_exists(ext_slot_id):
-    """Check if a slot exists in Presenca by externalId."""
-    resp = presenca_api("GET", f"slots?externalId={ext_slot_id}")
-    if resp and "data" in resp and resp["data"]:
-        return resp["data"][0]
-    return None
+def _load_presenca_slots(prof_presenca_id):
+    """Load ALL slots for a professional from Presenca in one call.
+    Returns dict of (date, time) -> slot object."""
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    resp = presenca_api("GET", f"slots?professionalId={prof_presenca_id}&dateFrom={today}&limit=1000")
+    slots = {}
+    if resp and "data" in resp:
+        for s in resp["data"]:
+            s_date = (s.get("slotDate") or "")[:10]
+            raw_time = s.get("slotTime") or ""
+            if "T" in raw_time:
+                s_time = raw_time.split("T")[1][:5]
+            else:
+                s_time = raw_time[:5]
+            if s_date and s_time:
+                slots[(s_date, s_time)] = s
+    return slots
 
 
 def sync_slots(cache):
     """Sync slots from vSaude availability to Presenca.
 
     For each professional:
-    1. Get free slots from vSaude (GetAvailabilityWindow)
-    2. For each free slot: check by externalId if exists in Presenca
-       - Not exists -> create
-       - Exists but blocked -> unblock
-       - Exists and available -> skip (no-op)
+    1. Load ALL existing Presenca slots in one GET call
+    2. Get free slots from vSaude (GetAvailabilityWindow)
+    3. Compare locally - only call API when something needs to change:
+       - vSaude free + not in Presenca -> create
+       - vSaude free + Presenca blocked -> unblock
+       - vSaude free + Presenca available -> skip (no API call)
     """
     log.info("[SLOTS] START")
 
@@ -311,7 +324,11 @@ def sync_slots(cache):
         prof_name = prof.get("name", "?")
         prof_presenca_id = prof.get("id")
 
-        # Get FREE slots from vSaude
+        # 1. Load existing Presenca slots for this professional (ONE call)
+        time.sleep(API_DELAY)
+        pr_slots = _load_presenca_slots(prof_presenca_id)
+
+        # 2. Get FREE slots from vSaude
         result = vsaude_post("ScheduleService/GetAvailabilityWindow", {
             "procedureId": proc_id, "professionalId": ext_id,
         })
@@ -326,30 +343,30 @@ def sync_slots(cache):
         unblocked = 0
         skipped = 0
 
+        # 3. Compare locally
         for day in result:
             for slot in day.get("availability", []):
                 slot_date, slot_time = utc_to_brt(slot.get("time", ""))
                 if not slot_date:
                     continue
 
-                ext_slot_id = f"{ext_id}_{slot_date}_{slot_time}"
-
-                # Check if exists by externalId
-                time.sleep(API_DELAY)
-                existing = _slot_exists(ext_slot_id)
+                existing = pr_slots.get((slot_date, slot_time))
 
                 if existing:
                     if not existing.get("isAvailable") or existing.get("isBlocked"):
                         # Blocked -> unblock
+                        time.sleep(API_DELAY)
                         presenca_api("PUT", f"slots/{existing['id']}", {
                             "isAvailable": True, "isBlocked": False,
                         })
                         unblocked += 1
                     else:
-                        skipped += 1
+                        skipped += 1  # Already available, no API call needed
                 else:
-                    # Create new slot
-                    resp = presenca_api("POST", "slots", {
+                    # Slot not in Presenca -> create
+                    ext_slot_id = f"{ext_id}_{slot_date}_{slot_time}"
+                    time.sleep(API_DELAY)
+                    presenca_api("POST", "slots", {
                         "professionalId": prof_presenca_id,
                         "specialtyId": spec_id,
                         "procedureId": proc_uuid,
@@ -360,10 +377,7 @@ def sync_slots(cache):
                         "isBlocked": False,
                         "externalId": ext_slot_id,
                     })
-                    if resp and resp.get("conflict"):
-                        skipped += 1  # Already exists without externalId
-                    else:
-                        created += 1
+                    created += 1
 
         if created or unblocked:
             log.info("[SLOTS] %s: +%d created, %d unblocked, %d skipped",
