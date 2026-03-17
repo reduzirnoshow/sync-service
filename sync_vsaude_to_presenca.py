@@ -225,7 +225,7 @@ def sync_slots(cache):
         # 2. Get current Presenca slots for this professional
         time.sleep(API_DELAY)
         pr_resp = presenca_api("GET",
-            f"appointment-slots?professionalId={prof_presenca_id}&dateFrom=2026-03-17&dateTo=2026-12-31")
+            f"slots?professionalId={prof_presenca_id}&dateFrom=2026-03-17&dateTo=2026-12-31")
 
         pr_slots = {}  # (date, time) -> slot obj
         if pr_resp and "data" in pr_resp:
@@ -250,7 +250,7 @@ def sync_slots(cache):
                 if not slot.get("isAvailable") or slot.get("isBlocked"):
                     # Slot exists but blocked -> unblock
                     time.sleep(API_DELAY)
-                    presenca_api("PUT", f"appointment-slots/{slot['id']}", {
+                    presenca_api("PUT", f"slots/{slot['id']}", {
                         "isAvailable": True, "isBlocked": False,
                     })
                     unblocked += 1
@@ -262,7 +262,7 @@ def sync_slots(cache):
                 ext_slot_id = f"{ext_id}_{date}_{tm}"
 
                 time.sleep(API_DELAY)
-                presenca_api("POST", "appointment-slots", {
+                presenca_api("POST", "slots", {
                     "professionalId": prof_presenca_id,
                     "specialtyId": spec_id,
                     "procedureId": proc_uuid,
@@ -280,7 +280,7 @@ def sync_slots(cache):
             if (date, tm) not in vs_free:
                 if slot.get("isAvailable") and not slot.get("isBlocked"):
                     time.sleep(API_DELAY)
-                    presenca_api("PUT", f"appointment-slots/{slot['id']}", {
+                    presenca_api("PUT", f"slots/{slot['id']}", {
                         "isAvailable": False, "isBlocked": True,
                     })
                     blocked += 1
