@@ -18,11 +18,93 @@ STATUS_LABEL = {
 }
 
 
+def sync_professionals(cache):
+    """Sync professional data: phone, email, active from vSaude."""
+    result = vsaude_post("HealthProfessionalService/GetAll", {"maxResultCount": 100})
+    if not result:
+        return
+    items = result.get("items", result) if isinstance(result, dict) else result
+    updated = 0
+
+    for vs in items:
+        ext_id = vs.get("id", "")
+        pr = cache.get("professionals", {}).get(ext_id)
+        if not pr:
+            continue
+
+        user = vs.get("user") or {}
+        vs_email = user.get("emailAddress", "") or ""
+        vs_phone = user.get("phoneNumber", "") or ""
+        vs_active = user.get("isActive", True)
+
+        diffs = {}
+        if vs_email and (pr.get("email") or "") != vs_email:
+            diffs["email"] = vs_email
+        if vs_phone and (pr.get("phone") or "") != vs_phone:
+            diffs["phone"] = vs_phone
+        if pr.get("active") != vs_active:
+            diffs["active"] = vs_active
+
+        if diffs:
+            name = clean_name(vs.get("name", ""))
+            log.info("[VS->PR] PROF UPDATE: %s -> %s", name, diffs)
+            time.sleep(API_DELAY)
+            presenca_api("PUT", f"professionals/{pr['id']}", diffs)
+            updated += 1
+
+    if updated:
+        log.info("[VS->PR] Professionals updated: %d", updated)
+
+
+def sync_procedures(cache):
+    """Sync procedure data: price, duration from vSaude."""
+    result = vsaude_post("MedicalProcedureService/GetAll", {"maxResultCount": 100})
+    if not result:
+        return
+    items = result.get("items", []) if isinstance(result, dict) else result
+    updated = 0
+
+    for vs in items:
+        ext_id = str(vs.get("id", ""))
+        pr = cache.get("procedures", {}).get(ext_id)
+        if not pr:
+            continue
+
+        vs_price = vs.get("price", 0)
+        vs_duration = vs.get("duration", 30)
+
+        diffs = {}
+        pr_price = pr.get("price")
+        if pr_price is not None:
+            try:
+                if abs(float(pr_price) - float(vs_price)) > 0.01:
+                    diffs["price"] = vs_price
+            except (ValueError, TypeError):
+                pass
+        pr_dur = pr.get("durationMinutes") or pr.get("duration_minutes")
+        if pr_dur is not None and pr_dur != vs_duration:
+            diffs["durationMinutes"] = vs_duration
+
+        if diffs:
+            name = clean_name(vs.get("name", ""))
+            log.info("[VS->PR] PROC UPDATE: %s -> %s", name, diffs)
+            time.sleep(API_DELAY)
+            presenca_api("PUT", f"procedures/{pr['id']}", diffs)
+            updated += 1
+
+    if updated:
+        log.info("[VS->PR] Procedures updated: %d", updated)
+
+
 def run(cache, since_date):
     """Run vSaude -> Presenca sync. Returns stats dict."""
     log.info("=" * 50)
     log.info("[VS->PR] START since=%s", since_date)
     log.info("=" * 50)
+
+    # Sync professionals and procedures (data updates)
+    sync_professionals(cache)
+    sync_procedures(cache)
 
     result = vsaude_post("ReportService/GetAttendance", {"maxResultCount": 1000})
     if not result:
@@ -33,7 +115,7 @@ def run(cache, since_date):
     filtered = [a for a in items if (a.get("date", "") or "")[:10] >= since_date]
     log.info("[VS->PR] vSaude returned %d total, %d since %s", len(items), len(filtered), since_date)
 
-    stats = {"pat_new": 0, "appt_new": 0, "appt_status": 0, "ok": 0, "skip": 0}
+    stats = {"pat_new": 0, "pat_upd": 0, "appt_new": 0, "appt_status": 0, "ok": 0, "skip": 0}
 
     for a in sorted(filtered, key=lambda x: x.get("date", "")):
         vs_hp = a.get("healthProfessional")
@@ -94,6 +176,23 @@ def run(cache, since_date):
             else:
                 log.error("[VS->PR] Failed to create patient %s", pat_name)
             stats["pat_new"] += 1
+        elif pr_patient:
+            # Patient exists - check for updates
+            pat_diffs = {}
+            vs_phone = vs_patient.get("phoneNumber", "") or ""
+            vs_email = vs_patient.get("email", "") or ""
+            if pat_name and (pr_patient.get("name") or "") != pat_name:
+                pat_diffs["name"] = pat_name
+            if vs_phone and (pr_patient.get("phone") or "") != vs_phone:
+                pat_diffs["phone"] = vs_phone
+                pat_diffs["whatsappPhone"] = vs_phone
+            if vs_email and (pr_patient.get("email") or "") != vs_email:
+                pat_diffs["email"] = vs_email
+            if pat_diffs:
+                log.info("[VS->PR] PAT UPDATE: %s -> %s", pat_name, list(pat_diffs.keys()))
+                time.sleep(API_DELAY)
+                presenca_api("PUT", f"patients/{pr_patient['id']}", pat_diffs)
+                stats["pat_upd"] += 1
 
         patient_id = pr_patient.get("id") if pr_patient else None
         if not patient_id:
@@ -169,8 +268,8 @@ def run(cache, since_date):
                 stats["ok"] += 1
 
     log.info("-" * 50)
-    log.info("[VS->PR] RESULT: patients_new=%d appts_new=%d status_changed=%d synced=%d skipped=%d",
-             stats["pat_new"], stats["appt_new"], stats["appt_status"], stats["ok"], stats["skip"])
+    log.info("[VS->PR] RESULT: patients_new=%d patients_updated=%d appts_new=%d status_changed=%d synced=%d skipped=%d",
+             stats["pat_new"], stats["pat_upd"], stats["appt_new"], stats["appt_status"], stats["ok"], stats["skip"])
 
     # Sync slots as part of the same cycle
     slot_stats = sync_slots(cache)
