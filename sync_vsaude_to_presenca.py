@@ -365,18 +365,20 @@ def sync_slots(cache):
                 else:
                     # Slot not in Presenca -> create
                     ext_slot_id = f"{ext_id}_{slot_date}_{slot_time}"
-                    time.sleep(API_DELAY)
-                    presenca_api("POST", "slots", {
+                    slot_body = {
                         "professionalId": prof_presenca_id,
                         "specialtyId": spec_id,
-                        "procedureId": proc_uuid,
                         "slotDate": slot_date,
                         "slotTime": slot_time,
                         "durationMinutes": 30,
                         "isAvailable": True,
                         "isBlocked": False,
                         "externalId": ext_slot_id,
-                    })
+                    }
+                    if proc_uuid:
+                        slot_body["procedureId"] = proc_uuid
+                    time.sleep(API_DELAY)
+                    presenca_api("POST", "slots", slot_body)
                     created += 1
 
         if created or unblocked:

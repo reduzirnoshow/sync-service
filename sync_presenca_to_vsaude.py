@@ -102,35 +102,8 @@ def _sync_patients(cache, since_date):
                 created += 1
             else:
                 log.error("[PR->VS]   FAILED to create patient")
-        else:
-            # Existing patient - check for updates
-            vs_pat = vs_patients.get(ext_id)
-            if not vs_pat:
-                continue
-
-            diffs = {}
-            vs_name = clean_name(vs_pat.get("name", ""))
-            vs_phone = vs_pat.get("phoneNumber", "") or ""
-
-            if name and vs_name != name:
-                parts = name.split(" ", 1)
-                diffs["name"] = parts[0]
-                diffs["surname"] = parts[1] if len(parts) > 1 else ""
-            if phone and vs_phone != phone:
-                diffs["phoneNumber"] = phone
-            if email and (vs_pat.get("email", "") or "") != email:
-                diffs["email"] = email
-
-            if diffs:
-                log.info("[PR->VS] PAT UPDATE: %s -> %s", name, list(diffs.keys()))
-                # vSaude Update needs full object - get it first
-                full_pat = vsaude_post("PatientService/Get", None)
-                # Use simpler approach: just log for now, full update needs GET+PUT
-                # TODO: implement full patient update via GET then PUT
-                updated += 1
-
-    log.info("[PR->VS] Patients: %d created, %d updated", created, updated)
-    return {"created": created, "updated": updated}
+    log.info("[PR->VS] Patients: %d created", created)
+    return {"created": created, "updated": 0}
 
 
 # ─────────────────────────────────────────────────────────────
